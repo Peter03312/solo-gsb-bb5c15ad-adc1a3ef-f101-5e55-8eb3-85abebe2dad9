@@ -11,6 +11,7 @@ from sqlalchemy import (
     Index,
     Numeric,
     String,
+    Text,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -462,6 +463,55 @@ class LoadingCorrection(Base):
     expected_version: Mapped[int] = mapped_column(nullable=False)
     version: Mapped[int] = mapped_column(nullable=False)
     reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class EvidenceSeal(Base):
+    """责任证据封存包（append-only，封存内容此后不可改）。
+
+    调查人员凭**案件编号** ``case_id``（主键，客户端指定）、货物编号、
+    已闭合越温区间的稳定标识与其**当前快照标识**封存责任证据。封存于持
+    货物行锁的单事务内、在一致的已提交视图上进行：保存区间责任片段、
+    当时各责任方的有效表态，以及重建该区间所用的货物自有事件、车载读数
+    （当前有效温度与更正版本、是否被自有测温取代）、当前装卸窗口（窗口
+    版本）与货物温控参数，并对全部封存内容生成内容摘要 ``content_digest``
+    （``sha256:`` 前缀，规范化 JSON 取 SHA-256）。
+
+    封存行一经写入永不修改、不删除：
+
+    * 同案件编号 + 同请求（货物 / 区间 / 快照三元组一致）重试：即使现况
+      已变（区间消失 / 重开 / 快照变化）也返回**原包**（幂等重传）；
+    * 同案件编号 + 异请求 → ``409 case_id_conflict``；
+    * 区间消失 / 重开 / 快照已变时拒绝，事务回滚、不留封存记录。
+
+    ``content`` 为封存时刻的规范化 JSON 原文（与摘要一一对应，查询封存包
+    时原样返回）；``request_hash`` 为请求三元组的指纹，供幂等 / 冲突裁决；
+    其余 *_id / snapshot 列为检索与状态判断的冗余列。
+    """
+
+    __tablename__ = "evidence_seal"
+    __table_args__ = (
+        Index("ix_evidence_seal_cargo_interval", "cargo_id", "interval_key"),
+    )
+
+    case_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    cargo_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("cargo.cargo_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    interval_key: Mapped[str] = mapped_column(String(68), nullable=False)
+    snapshot_id: Mapped[str] = mapped_column(String(71), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    sealed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

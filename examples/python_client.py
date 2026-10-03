@@ -635,6 +635,72 @@ def main() -> None:
                  "new_loaded_at": "2026-09-30T17:00:00+08:00",
                  "new_unloaded_at": "2026-09-30T17:00:00+08:00"}))
 
+        # ----- 责任证据封存 -----
+        print("\n########## 责任证据封存 ##########")
+        sc, st = "COLD-SEAL-PY", "TRUCK-SEAL-PY"
+        api.post("/cargo", json={
+            "cargo_id": sc, "started_at": "2026-10-03T08:00:00+08:00",
+            "temp_upper_limit": "4.0", "initial_holder": "北京冷库"})
+        api.post("/trips", json={"trip_id": st, "vehicle_no": "京B-封PY"})
+        api.post(f"/trips/{st}/manifest", json={"items": [{
+            "cargo_id": sc,
+            "loaded_at": "2026-10-03T08:00:00+08:00",
+            "unloaded_at": "2026-10-03T20:00:00+08:00"}]})
+        # 09:00 车载 7℃ 开启 veh:svr-py-1；10:00 北京->上海交接拆分；12:00 车载 3℃ 闭合
+        api.post("/vehicle-readings", json={
+            "reading_id": "svr-py-1", "trip_id": st,
+            "read_at": "2026-10-03T09:00:00+08:00", "temperature": "7.0"})
+        api.post("/events", json={
+            "event_id": "se-py-h1", "cargo_id": sc,
+            "occurred_at": "2026-10-03T10:00:00+08:00",
+            "giver": "北京冷库", "receiver": "上海冷库"})
+        api.post("/vehicle-readings", json={
+            "reading_id": "svr-py-2", "trip_id": st,
+            "read_at": "2026-10-03T12:00:00+08:00", "temperature": "3.0"})
+
+        iv = api.get(f"/cargo/{sc}/responsibilities").json()["intervals"][0]
+        iid, snap = iv["interval_id"], iv["snapshot_id"]
+        print("区间标识 =", iid, "快照 =", snap[:20], "…")
+
+        seal_body = {
+            "case_id": "CASE-SEAL-PY-1",
+            "cargo_id": sc,
+            "interval_id": iid,
+            "snapshot_id": snap,
+        }
+        show("封存责任证据（201；含内容摘要与全部重建证据）",
+             api.post("/evidence-seals", json=seal_body))
+        created = api.post("/evidence-seals", json=seal_body).json()
+        print("同请求重传：replayed =", created.get("replayed"))
+
+        show("查询封存包（原内容与摘要，不可改）",
+             api.get("/evidence-seals/CASE-SEAL-PY-1"))
+        show("对照现况（无变化 -> unchanged）",
+             api.get("/evidence-seals/CASE-SEAL-PY-1/diff"))
+
+        # 区间内补 11:00 不超限车载读数 -> 提前闭合，快照变化
+        api.post("/vehicle-readings", json={
+            "reading_id": "svr-py-3", "trip_id": st,
+            "read_at": "2026-10-03T11:00:00+08:00", "temperature": "3.0"})
+        show("旧快照封存新案件（409 stale_snapshot，拒绝不留记录）",
+             api.post("/evidence-seals", json={**seal_body, "case_id": "CASE-SEAL-PY-STALE"}))
+        show("原案件同请求重试（200 replayed，即使现况已变）",
+             api.post("/evidence-seals", json=seal_body))
+        show("对照现况（changed：片段与读数增删变更）",
+             api.get("/evidence-seals/CASE-SEAL-PY-1/diff"))
+        show("同案件编号异请求（409 case_id_conflict）",
+             api.post("/evidence-seals",
+                      json={**seal_body, "snapshot_id": "sha256:" + "f" * 64}))
+
+        # 测温更正开启读数为不超限 -> 区间消失；对照 disappeared，原包不改写
+        api.post("/corrections", json={
+            "correction_id": "scorr-py-1", "target_type": "vehicle_reading",
+            "target_id": "svr-py-1", "expected_version": 0,
+            "new_temperature": "2.0"})
+        show("更正后对照现况（disappeared；原包不变）",
+             api.get("/evidence-seals/CASE-SEAL-PY-1/diff"))
+        show("未知案件（404 seal_not_found）", api.get("/evidence-seals/NO-SUCH-CASE"))
+
 
 if __name__ == "__main__":
     main()

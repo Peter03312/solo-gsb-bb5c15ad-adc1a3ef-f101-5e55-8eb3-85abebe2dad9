@@ -240,3 +240,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_loading_correction_window_version
 
 CREATE INDEX IF NOT EXISTS ix_loading_correction_window
     ON loading_correction (trip_id, cargo_id, origin_loaded_at, created_at);
+
+-- 责任证据封存（append-only：封存内容此后不可改）。
+-- 调查人员凭案件编号（主键）、货物编号、已闭合区间稳定标识与当前快照标识封存；
+-- content 为封存时刻的规范化 JSON 原文，content_digest 为其 SHA-256 摘要；
+-- request_hash 为（货物/区间/快照）请求指纹：同案件编号同请求重试即使现况
+-- 已变也返回原包，异请求冲突。区间消失/重开/快照已变拒绝且不留记录。
+CREATE TABLE IF NOT EXISTS evidence_seal (
+    case_id        VARCHAR(128) PRIMARY KEY,
+    cargo_id       VARCHAR(64)  NOT NULL
+                     REFERENCES cargo(cargo_id) ON DELETE RESTRICT,
+    interval_key   VARCHAR(68)  NOT NULL,
+    snapshot_id    VARCHAR(71)  NOT NULL,
+    request_hash   VARCHAR(71)  NOT NULL,
+    content        TEXT         NOT NULL,
+    content_digest VARCHAR(71)  NOT NULL,
+    sealed_at      TIMESTAMPTZ  NOT NULL,
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_evidence_seal_cargo_interval
+    ON evidence_seal (cargo_id, interval_key);

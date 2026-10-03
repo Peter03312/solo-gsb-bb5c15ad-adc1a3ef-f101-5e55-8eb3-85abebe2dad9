@@ -606,3 +606,117 @@ curl -sS -X POST "$BASE/trips/$LTRIP/loading-corrections" \
     \"new_loaded_at\": \"2026-09-30T17:00:00+08:00\",
     \"new_unloaded_at\": \"2026-09-30T17:00:00+08:00\", \"reason\": \"非法时段\"
   }"; echo
+
+# ============================================================
+# 责任证据封存（案件编号 + 货物 + 已闭合区间标识 + 当前快照标识）
+# ============================================================
+SC="SEAL-CARGO-1"
+ST="SEAL-TRIP-1"
+
+echo "56) 准备封存场景：货物 4℃ 上限 + 车次/装卸窗口 + 车载读数开启/闭合的已闭合区间"
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$SC\",
+  \"started_at\": \"2026-10-03T08:00:00+08:00\",
+  \"temp_upper_limit\": \"4.0\",
+  \"initial_holder\": \"北京冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips" -H 'Content-Type: application/json' -d "{
+  \"trip_id\": \"$ST\", \"vehicle_no\": \"京B-封01\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips/$ST/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{
+    \"cargo_id\": \"$SC\",
+    \"loaded_at\": \"2026-10-03T08:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-03T20:00:00+08:00\"
+  }]
+}" >/dev/null
+# 10:00 交接拆分责任；09:00 车载 7℃ 开启 veh:svr-1，12:00 车载 3℃ 闭合
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"svr-1\", \"trip_id\": \"$ST\",
+  \"read_at\": \"2026-10-03T09:00:00+08:00\", \"temperature\": \"7.0\"
+}" >/dev/null
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"sev-h1\", \"cargo_id\": \"$SC\",
+  \"occurred_at\": \"2026-10-03T10:00:00+08:00\",
+  \"giver\": \"北京冷库\", \"receiver\": \"上海冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"svr-2\", \"trip_id\": \"$ST\",
+  \"read_at\": \"2026-10-03T12:00:00+08:00\", \"temperature\": \"3.0\"
+}" >/dev/null
+
+# 取区间标识（veh:svr-1）与当前快照标识
+read -r SIID SSNAP < <(python3 - "$BASE" "$SC" <<'PY'
+import json, sys, urllib.request
+base, cargo = sys.argv[1], sys.argv[2]
+with urllib.request.urlopen(f"{base}/cargo/{cargo}/responsibilities") as r:
+    iv = json.load(r)["intervals"][0]
+print(iv["interval_id"], iv["snapshot_id"])
+PY
+)
+echo "    区间标识=$SIID 快照=$SSNAP"
+
+echo "57) 封存责任证据（案件编号 CASE-SEAL-1）"
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"CASE-SEAL-1\",
+  \"cargo_id\": \"$SC\",
+  \"interval_id\": \"$SIID\",
+  \"snapshot_id\": \"$SSNAP\"
+}" | python3 -c 'import json,sys; d=json.load(sys.stdin); c=d["content"]; print("    digest =", d["content_digest"]); print("    片段 =", [(s["start"][11:16], s["end"][11:16], s["responsible_party"]) for s in c["interval"]["segments"]]); print("    车载读数 =", [(r["reading_id"], r["effective_temperature"], r["version"], r["adopted"]) for r in c["vehicle_readings"]]); print("    窗口版本 =", [w["window_version"] for w in c["loading_windows"]])'
+
+echo "58) 同案件编号同请求重传 -> 200 replayed（即使此后现况已变也返回原包）"
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"CASE-SEAL-1\", \"cargo_id\": \"$SC\",
+  \"interval_id\": \"$SIID\", \"snapshot_id\": \"$SSNAP\"
+}" | python3 -c 'import json,sys; print("    replayed =", json.load(sys.stdin).get("replayed"))'
+
+echo "59) 查询封存包（原内容与摘要，不可改）"
+curl -sS "$BASE/evidence-seals/CASE-SEAL-1" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    digest =", d["content_digest"], "sealed_at =", d["sealed_at"])'
+
+echo "60) 对照现况（封存后无变化 -> unchanged，各项变更为空）"
+curl -sS "$BASE/evidence-seals/CASE-SEAL-1/diff" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    status =", d["status"], "片段变更 =", len(d["segment_changes"]), "读数变更 =", len(d["evidence_changes"]["vehicle_readings"]))'
+
+echo "61) 快照已变时用旧快照封存新案件 -> 409 stale_snapshot（不留记录）"
+# 区间内补一笔 11:00 不超限车载读数 -> 区间提前闭合，快照变化
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"svr-3\", \"trip_id\": \"$ST\",
+  \"read_at\": \"2026-10-03T11:00:00+08:00\", \"temperature\": \"3.0\"
+}" >/dev/null
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"CASE-SEAL-STALE\", \"cargo_id\": \"$SC\",
+  \"interval_id\": \"$SIID\", \"snapshot_id\": \"$SSNAP\"
+}"; echo
+
+echo "62) 原案件同请求重试仍返回原包（replayed）；对照现况 -> changed（片段/读数增删变更）"
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"CASE-SEAL-1\", \"cargo_id\": \"$SC\",
+  \"interval_id\": \"$SIID\", \"snapshot_id\": \"$SSNAP\"
+}" | python3 -c 'import json,sys; print("    replayed =", json.load(sys.stdin).get("replayed"))'
+curl -sS "$BASE/evidence-seals/CASE-SEAL-1/diff" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("    status =", d["status"])
+print("    片段变更 =", [(x["start"][11:16], x["change"]) for x in d["segment_changes"]])
+print("    读数新增 =", [x["key"] for x in d["evidence_changes"]["vehicle_readings"] if x["change"]=="added"])'
+
+echo "63) 同案件编号异请求冲突 -> 409 case_id_conflict"
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"CASE-SEAL-1\", \"cargo_id\": \"$SC\",
+  \"interval_id\": \"$SIID\", \"snapshot_id\": \"sha256:$(python3 -c 'print("f"*64)')\"
+}"; echo
+
+echo "64) 测温更正使开启读数不超限 -> 区间消失：对照 disappeared，但原包不改写"
+curl -sS -X POST "$BASE/corrections" -H 'Content-Type: application/json' -d "{
+  \"correction_id\": \"scorr-1\", \"target_type\": \"vehicle_reading\",
+  \"target_id\": \"svr-1\", \"expected_version\": 0, \"new_temperature\": \"2.0\"
+}" >/dev/null
+curl -sS "$BASE/evidence-seals/CASE-SEAL-1/diff" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("    status =", d["status"], "当前区间 =", d["current_interval"])
+vr=[x for x in d["evidence_changes"]["vehicle_readings"] if x["key"]=="svr-1"][0]
+print("    svr-1 变更字段 =", vr["fields"], "当前有效值/版本 =", vr["current"]["effective_temperature"], vr["current"]["version"])'
+curl -sS "$BASE/evidence-seals/CASE-SEAL-1" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); v=[r for r in d["content"]["vehicle_readings"] if r["reading_id"]=="svr-1"][0]; print("    原包 svr-1 有效值/版本 =", v["effective_temperature"], v["version"], "（不被更正改写）")'

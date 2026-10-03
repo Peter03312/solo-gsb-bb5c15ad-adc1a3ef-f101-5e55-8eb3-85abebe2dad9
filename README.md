@@ -10,6 +10,8 @@
 
 装卸时段更正（本轮）：装卸时段录错后，调度员可凭**更正编号**、**原车次 + 货物 + 首次登记装车时刻**（被更正窗口的稳定身份）、**期望版本**、**修正后的带时区装卸时刻**与**原因**更正已有登记。更正**只改这一条装卸窗口**——车次 / 货物归属与稳定身份永不改变；**原窗口和历次更正可追溯**（append-only），车次详情展示**当前窗口**。新时段仍**左闭右开**且起点严格早于终点，重叠校验按“同一货物在**任意车次**的当前时段不得重叠”进行并**排除该条旧窗口本身**，冲突整次拒绝、不留部分变更。更正后**车载读数适用性按当前窗口重算**（恰在装车时刻纳入、卸车时刻排除），晚到读数、同刻自有测温优先与更正后有效温度规则继续适用；越温报告、责任确认、同时越温查询及车次详情一律反映当前窗口，**表态历史保留**并按重建后的责任片段判断有效性。更正与相关读数写入、测温更正、事件和表态在单事务内加锁串行、保持事务一致；成功推进**车次修订号**，使旧装卸预检摘要失效。同更正编号同请求重传返回原结果、异请求冲突；版本过期、原窗口不存在或时段非法均拒绝且不留部分变更。既有登记接口语义保持不变。
 
+责任证据封存（本轮）：调查人员可凭**案件编号**、**货物编号**、**已闭合越温区间标识**及其**当前快照标识**封存责任证据。封存于持货物行锁的单事务内在**一致的已提交视图**上保存该区间**责任片段**、**当时有效表态**，以及重建该区间所用的**自有事件**、**车载读数及其有效温度与版本**（含同刻被自有测温取代的原始读数）、**当前装卸窗口及版本**与货物温控参数，并对全部封存内容生成 **SHA-256 内容摘要**；封存内容此后**不可改**。区间消失 / 重开或快照已变时**拒绝且不留记录**；**同案件编号同请求重试即使现况已变仍返回原包**，异请求冲突。`GET` 封存包恒返回**原内容与摘要**；对照现况接口按 `unchanged` / `changed` / `reopened` / `disappeared` 明确区间状态，并逐类列出证据项与责任片段的**增 / 删 / 变更**；后续晚到记录和测温 / 装卸更正**绝不改写原包**。既有责任确认与更正接口语义保持不变。
+
 ## 一、一键启动（Docker Compose，含数据库初始化）
 
 ```bash
@@ -84,6 +86,9 @@ uvicorn app.main:app --reload --port 8000
 | `POST` | `/trips/{trip_id}/manifest/confirm` | **携预检摘要确认登记**装卸时段（摘要过期拒绝；通过后批量原子校验） |
 | `POST` | `/trips/{trip_id}/loading-corrections` | **装卸时段更正**（只改该条窗口；原车次+货物+原装车时刻定位，乐观版本、原因） |
 | `GET` | `/trips/{trip_id}/loading-corrections` | 一条装卸窗口的**原始/当前窗口与历次更正**（按版本升序） |
+| `POST` | `/evidence-seals` | **责任证据封存**（案件编号 + 货物 + 已闭合区间标识 + 当前快照标识，生成内容摘要） |
+| `GET` | `/evidence-seals/{case_id}` | 查询**封存包原内容与摘要**（不可改） |
+| `GET` | `/evidence-seals/{case_id}/diff` | 封存包**对照当前现况**：证据项 / 责任片段的增删变更与区间状态 |
 | `POST` | `/vehicle-readings` | 写入车载测温读数（允许晚到；幂等 / 冲突） |
 | `GET` | `/trips/{trip_id}/simultaneous-excursions` | **质控：同一车次多票货物同时越温时段** |
 | `POST` | `/corrections` | **提交测温值更正**（只改温度；自有测温 / 车载读数） |
@@ -578,6 +583,150 @@ curl -G "http://localhost:8000/trips/TRUCK-1/loading-corrections" \
 `404 trip_not_found`；缺少 `origin_loaded_at` 返回 `422 missing_parameter`，
 时刻非法 / 无时区返回 `422`。
 
+### 2.12 责任证据封存 `POST /evidence-seals`
+
+调查人员可凭**案件编号**、**货物编号**、**已闭合越温区间标识**及其**当前
+快照标识**封存责任证据。封存于持货物行锁的单事务内、在**一致的已提交视图**
+上保存：
+
+* 区间**责任片段**（区间起止、开启 / 闭合读数来源坐标、当前快照标识）；
+* **当时有效表态**：封存时各责任方最新一条仍对当前快照有效的表态及汇总状态；
+* 重建该区间所用的**自有事件**（不晚于区间闭合时刻的全部测温 / 交接，测温附
+  当前有效温度 `effective_temperature` 与更正版本 `version`）；
+* 重建该区间所用的**车载读数**（区间内对该货物在车适用的读数，左闭右开；
+  附当前有效温度、更正版本，同刻有自有测温被取代的原始读数同样封存并标记
+  `adopted=false`）；
+* **当前装卸窗口及版本**（与区间时间范围相交的窗口，含稳定身份
+  `origin_loaded_at`、当前窗口与 `window_version`）；
+* 货物温控参数（编号、起始时间、温度上限、起始保管方）。
+
+封存对上述全部内容取规范化 JSON 的 SHA-256，生成**内容摘要**
+`content_digest`（`sha256:` 前缀）；封存内容（规范化原文与摘要）此后
+**不可改**（append-only，任何接口都不修改 / 不删除）。
+
+```json
+{
+  "case_id": "CASE-2026-001",
+  "cargo_id": "COLD-001",
+  "interval_id": "evt-temp-1",
+  "snapshot_id": "sha256:836e6b3a…e797e4"
+}
+```
+
+* `case_id`：客户端指定的案件编号（封存包主键）；
+* `interval_id`：已闭合区间稳定标识（自有开启=测温事件ID；车载开启=`veh:<读数ID>`，
+  先经 `GET /cargo/{cargo_id}/responsibilities` 获取）；
+* `snapshot_id`：该区间**当前快照标识**（同上接口返回）。
+
+处理规则：
+
+* **拒绝且不留记录**：
+  - 货物不存在 → `404 cargo_not_found`；区间不存在 → `404 interval_not_found`；
+  - 区间仍开放 → `422 interval_open`；
+  - 提交的快照标识与当前快照不一致（区间边界 / 责任片段已因晚到记录或更正
+    变化）→ `409 stale_snapshot`；
+    以上失败整事务回滚，**不留任何封存记录**。
+* **同案件编号重试（幂等）**：同 `case_id` + 同请求（货物 / 区间 / 快照
+  三元组一致）重传，**即使此后现况已变**（区间消失 / 重开 / 快照变化）也
+  返回**原封存包**：`200 {"replayed": true, "seal": …原包…}`；
+* **异请求冲突**：同 `case_id` + 异请求（不同货物 / 区间 / 快照）→
+  `409 case_id_conflict`，原封存不变；
+* 封存与同货物的事件写入、车载读数写入、责任表态、测温更正、装卸登记 /
+  更正共用货物行锁，封存所见即持锁期间的最新一致视图。
+
+回执 `201`（结构见下）：`case_id` / `cargo_id` / `interval_id` /
+`snapshot_id`（封存绑定的快照）/ `sealed_at` / `content_digest` 与 `content`
+（封存内容原文）。
+
+### 2.13 查询封存包 `GET /evidence-seals/{case_id}`
+
+按案件编号返回**原封存内容与内容摘要**：封存内容此后不可改，响应恒为封存
+时刻的原文（片段、表态、自有事件、车载读数有效温度 / 版本、装卸窗口及版本
+均为封存时值）。案件不存在 → `404 seal_not_found`。
+
+```json
+{
+  "case_id": "CASE-2026-001",
+  "cargo_id": "COLD-001",
+  "interval_id": "evt-temp-1",
+  "snapshot_id": "sha256:836e6b3a…",
+  "content_digest": "sha256:2f1a…",
+  "sealed_at": "2026-10-03T03:30:00Z",
+  "content": {
+    "case_id": "CASE-2026-001",
+    "sealed_at": "2026-10-03T03:30:00Z",
+    "cargo": { "cargo_id": "COLD-001", "started_at": "…",
+               "temp_upper_limit": "4.000", "initial_holder": "北京冷库" },
+    "interval": {
+      "interval_id": "evt-temp-1",
+      "start": "2026-09-30T02:00:00Z", "end": "2026-09-30T08:00:00Z",
+      "is_open": false,
+      "start_source": "own", "end_source": "vehicle",
+      "start_event_id": "evt-temp-1", "end_event_id": null,
+      "start_reading_id": null, "end_reading_id": "vr-2",
+      "start_trip_id": null, "end_trip_id": "TRUCK-1",
+      "snapshot_id": "sha256:836e6b3a…",
+      "segments": [
+        { "start": "…T02:00:00Z", "end": "…T04:00:00Z", "responsible_party": "北京冷库" },
+        { "start": "…T04:00:00Z", "end": "…T08:00:00Z", "responsible_party": "上海冷库" }
+      ]
+    },
+    "current_valid_stances": [
+      { "stance_id": "stance-bj-1", "responsible_party": "北京冷库",
+        "stance": "confirm", "reason": null,
+        "created_at": "…", "snapshot_id": "sha256:836e6b3a…",
+        "segments": [ { "start": "…", "end": "…", "responsible_party": "北京冷库" } ] }
+    ],
+    "summary": "pending",
+    "own_events": [
+      { "event_id": "evt-temp-1", "event_type": "measurement",
+        "occurred_at": "…", "temperature": "8.200",
+        "effective_temperature": "8.200", "version": 0,
+        "giver": null, "receiver": null }
+    ],
+    "vehicle_readings": [
+      { "reading_id": "vr-2", "trip_id": "TRUCK-1", "read_at": "…",
+        "temperature": "3.100", "effective_temperature": "3.100",
+        "version": 0, "adopted": true }
+    ],
+    "loading_windows": [
+      { "trip_id": "TRUCK-1", "cargo_id": "COLD-001",
+        "origin_loaded_at": "…", "loaded_at": "…", "unloaded_at": "…",
+        "window_version": 0 }
+    ],
+    "content_digest": "sha256:2f1a…"
+  }
+}
+```
+
+### 2.14 封存包对照现况 `GET /evidence-seals/{case_id}/diff`
+
+把封存包与当前数据对照（**只读**，不改写封存原包），给出明确状态：
+
+| `status` | 含义 |
+| --- | --- |
+| `unchanged` | 区间仍存在、已闭合且快照标识与封存时相同（证据项无增删变更） |
+| `changed` | 区间仍闭合但边界 / 责任片段已变（快照不同） |
+| `reopened` | 同标识区间当前**已重新开放**（`current_interval.is_open=true`、`end`/`current_snapshot_id` 为 null） |
+| `disappeared` | 同标识区间当前**已消失**（`current_interval=null`） |
+
+响应逐类列出**证据项**的增 / 删 / 变更：
+
+* `evidence_changes.own_events`（键 `event_id`）、
+  `evidence_changes.vehicle_readings`（键 `reading_id`）、
+  `evidence_changes.loading_windows`（键 `trip_id|origin_loaded_at`）；
+  每项给出 `change`（`added` / `removed` / `changed`）、`fields`（变更字段，
+  如测温更正后为 `["effective_temperature","version"]`、窗口更正后含
+  `loaded_at` / `window_version`）与 `sealed` / `current` 新旧值；
+* `segment_changes`：责任片段以**片段起点**为稳定键的增 / 删 / 变更；
+  区间重开时当前末段 `end=null`，区间消失时封存片段全部为 `removed`；
+* 区间消失时证据对照范围自货物起始时间起、上界不限（新的开启点 / 窗口更正
+  可能把适用读数带到封存起点之前），以便逐项定位消失原因。
+
+**后续晚到记录和测温 / 装卸更正绝不改写封存原包**：它们只反映在本对照结果与
+当前重建接口中；任何时候 `GET /evidence-seals/{case_id}` 与封存成功回执
+（及幂等重放）返回的内容、摘要完全一致。
+
 ### 3. 追责报告 `GET /cargo/{cargo_id}/report`
 
 ```json
@@ -733,13 +882,19 @@ curl -G "http://localhost:8000/trips/TRUCK-1/loading-corrections" \
     - 更正后车载读数适用性按当前窗口重算（`loaded_at ≤ t < unloaded_at`，装车时刻纳入、卸车时刻排除）；晚到读数、同刻自有测温优先与测温更正后有效温度规则继续适用；越温报告、责任确认、同时越温查询与车次详情反映当前窗口；表态历史保留并按重建后的责任片段判断有效性；
     - 更正与相关读数写入、测温更正、货物事件、责任表态、装卸登记在单事务内按统一锁顺序（先货物行、再车次行）串行；成功使车次修订号 +1（旧装卸预检摘要随之失效），失败整事务回滚、不留部分变更（当前窗口不改、不追加更正、修订号不增）；
     - 同更正编号同请求（身份 + 期望版本 + 新窗口 + 原因全同）重传返回原结果（`replayed`）、异请求 `correction_id_conflict`；期望版本过期 `stale_window_version`、原窗口不存在 `loading_window_not_found`、车次不存在 `trip_not_found`、时段非法 / 缺时区均拒绝且不落部分结果；既有登记（含预检 / 确认）接口语义不变。
+19. **责任证据封存**：
+    - 调查人员凭**案件编号**（客户端指定，封存包主键）、货物编号、已闭合区间稳定标识与**当前快照标识**封存；封存于持货物行锁的单事务内、在一致的已提交视图上保存区间责任片段、当时各责任方最新有效表态与汇总状态、重建该区间所用的自有事件（不晚于闭合时刻的全部事件，测温附有效温度与版本）、车载读数（区间内在车适用，附有效温度 / 版本 / `adopted`，被同刻自有测温取代的原始读数同样封存）、与区间相交的当前装卸窗口（稳定身份 + 当前窗口 + `window_version`）及货物温控参数，并对规范化封存内容取 SHA-256 生成 `content_digest`；
+    - 封存内容 append-only、此后不可改（任何接口都不修改 / 不删除）；区间不存在 `interval_not_found` / 货物不存在 `cargo_not_found` / 区间开放 `interval_open` / 快照已变 `stale_snapshot` 一律拒绝，整事务回滚、不留封存记录；
+    - 同案件编号 + 同请求（货物 / 区间 / 快照三元组一致）重试**即使现况已变**（区间消失 / 重开 / 快照变化）也返回原封存包（`200 replayed`）；同案件编号 + 异请求 → `case_id_conflict`，原封存不变；
+    - `GET /evidence-seals/{case_id}` 恒返回原封存内容与摘要；封存包对照现况（只读）返回 `unchanged` / `changed`（仍闭合快照不同）/ `reopened`（明确重开，当前区间 `is_open=true`）/ `disappeared`（明确消失，当前区间为 null），并以稳定键列出自有事件（`event_id`）/ 车载读数（`reading_id`）/ 装卸窗口（`trip_id|origin_loaded_at`）与责任片段（片段起点）的 added / removed / changed（含变更字段与新旧值）；
+    - 后续晚到记录与测温 / 装卸更正只反映在对照结果与当前重建接口中，**绝不改写封存原包**（原包查询、封存回执与幂等重放恒一致）；封存与同货物的事件 / 读数 / 表态 / 更正 / 装卸写入经货物行锁串行；既有责任确认、表态与全部更正接口语义不变。
 
 错误响应统一格式：`{"error": {"code": "...", "message": "..."}}`。
 
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
-| 404 | `cargo_not_found` / `interval_not_found` / `trip_not_found` / `event_not_found` / `reading_not_found` / `loading_window_not_found` | 货物、已闭合区间、车次、更正目标事件或车载读数、被更正装卸窗口不存在 |
-| 409 | `cargo_exists` / `trip_exists` / `event_id_conflict` / `same_timestamp_conflict` / `integrity_conflict` / `stance_id_conflict` / `stale_snapshot` / `reading_id_conflict` / `loading_overlap` / `correction_id_conflict` / `stale_version` / `stale_trip_revision` / `stale_precheck_digest` / `stale_window_version` | 编号或同刻冲突、表态编号冲突、快照过期、装卸跨车次重叠、更正编号异内容 / 异请求冲突、测温更正期望版本过期、装卸窗口版本过期、预期车次修订号过期、预检摘要过期 |
+| 404 | `cargo_not_found` / `interval_not_found` / `trip_not_found` / `event_not_found` / `reading_not_found` / `loading_window_not_found` / `seal_not_found` | 货物、已闭合区间、车次、更正目标事件或车载读数、被更正装卸窗口、封存证据包（案件编号）不存在 |
+| 409 | `cargo_exists` / `trip_exists` / `event_id_conflict` / `same_timestamp_conflict` / `integrity_conflict` / `stance_id_conflict` / `stale_snapshot` / `reading_id_conflict` / `loading_overlap` / `correction_id_conflict` / `stale_version` / `stale_trip_revision` / `stale_precheck_digest` / `stale_window_version` / `case_id_conflict` | 编号或同刻冲突、表态编号冲突、快照过期（表态 / 封存）、装卸跨车次重叠、更正编号异内容 / 异请求冲突、测温更正期望版本过期、装卸窗口版本过期、预期车次修订号过期、预检摘要过期、封存案件编号异请求冲突 |
 | 422 | `before_start` / `giver_mismatch` / `bad_event_shape` / `interval_open` / `party_not_in_segment` / `bad_stance_shape` / `dispute_reason_required` / `invalid_loading_window` / `reserved_event_id` / `invalid_query_window` / `timezone_required` / `invalid_min_cargo` / `missing_parameter` / `handover_not_correctable` / `bad_correction_shape` / `bad_loading_correction_shape` | 业务校验失败（整体拒绝、不落库）；`handover_not_correctable`=交接不可更正，`bad_correction_shape`=测温更正目标类型非法 / 期望版本为负，`bad_loading_correction_shape`=装卸更正定位时刻非法，其余见各项 |
 | 200 | 响应体 `replayed=true` | 事件 / 表态 / 车载读数 / 测温更正同 ID 同内容幂等重传 |
 
@@ -760,12 +915,12 @@ python examples/python_client.py
 ```bash
 pip install pytest httpx
 
-pytest -q                                          # 156 个用例（内存库），并发用例自动跳过
+pytest -q                                          # 172 个用例（内存库），并发用例自动跳过
 DATABASE_URL="sqlite:////tmp/cc.db" \
-  pytest tests/test_concurrency.py -q              # 6 个并发串行化用例（事件 / 表态 / 车载读数 / 车载测温更正 / 自有测温更正 / 装卸时段更正，需文件型库）
+  pytest tests/test_concurrency.py -q              # 7 个并发串行化用例（事件 / 表态 / 车载读数 / 车载测温更正 / 自有测温更正 / 装卸时段更正 / 责任证据封存，需文件型库）
 ```
 
-测试覆盖：越温开闭、跨交接责任拆分、同刻测温+交接、未闭合区间、晚到重算、交出方整体拒绝、同刻冲突、幂等重传、并发写入串行化，责任确认的快照校验、确认/异议、汇总状态、表态幂等与改口、晚到事件后表态逐片段失效与历史可查；车次登记、装卸时段左闭右开与跨车次重叠整批拒绝、车载读数仅对在车货物按各自上限越温、同刻自有测温优先（车载原始可查）、交接不被车载读数改变、区间稳定标识 `veh:<读数ID>` 与车载区间表态/失效、车载读数晚到重建、车载写入与受影响货物事件写入的并发串行化；质控同时越温查询的集合变化分段、相邻同集合合并、门槛过滤、查询窗与装卸时段裁剪（左闭右开）、未闭合区间裁至查询终点、装车前带入的开放区间自装车时刻起算、同刻自有优先、晚到读数后查询反映新结果、空结果与参数 / 未知车次错误；测温值更正的只改温度（时间 / 归属 / 原编号不变）、版本递增与乐观锁、原始记录保留原值另显示有效温度与版本、历次更正可查、自有 / 车载更正后报告 / 时间线 / 责任确认 / 同时越温按有效值重建、车载更正同时影响在车全部货物、同刻自有优先与左闭右开继续适用、交接不可更正、更正与原记录幂等重传 / 异内容冲突 / 版本过期 / 目标缺失拒绝且不落部分结果、更正后历史表态按重建片段判定有效性、车载 / 自有更正并发串行化；装卸前预检的分段分析（货物集合 / 温度上限差异 / 读数覆盖与有效值 / 潜在越温风险与同刻自有取代标记、左闭右开边界）、预检只读不落库、预期车次修订号校验、未知车次 / 货物与非法时段报错、确认携摘要（通过后沿用批量原子校验、重叠整批拒绝）、摘要过期（装卸登记 / 新增读数 / 读数更正 / 挪用到其他批次 / 重复使用均拒绝且不落库）、车次修订号随装卸登记 / 读数写入 / 读数更正单调递增且失败不递增；以及本轮装卸时段更正的只改该条窗口（车次 / 货物归属与稳定身份不变、其它窗口不动）、原窗口与历次更正 append-only 可追溯、车次详情展示当前窗口 / 稳定身份 / 版本、新窗口左闭右开与必须带时区 / 原因为空拒绝、重叠校验排除自身且跨车次 / 同车次重叠整批拒绝（首尾相接允许）、版本乐观锁（过期 `stale_window_version`）、原窗口不存在 / 车次不存在拒绝、同编号同请求幂等 / 异请求冲突、失败不留部分变更且编号可复用、车载读数适用性按当前窗口重算（装车纳入 / 卸货排除）、越温报告 / 时间线 / 责任确认 / 同时越温反映当前窗口、表态历史保留并按重建片段失效、成功推进车次修订号使旧预检摘要过期、装卸时段更正与事件写入并发串行化。
+测试覆盖：越温开闭、跨交接责任拆分、同刻测温+交接、未闭合区间、晚到重算、交出方整体拒绝、同刻冲突、幂等重传、并发写入串行化，责任确认的快照校验、确认/异议、汇总状态、表态幂等与改口、晚到事件后表态逐片段失效与历史可查；车次登记、装卸时段左闭右开与跨车次重叠整批拒绝、车载读数仅对在车货物按各自上限越温、同刻自有测温优先（车载原始可查）、交接不被车载读数改变、区间稳定标识 `veh:<读数ID>` 与车载区间表态/失效、车载读数晚到重建、车载写入与受影响货物事件写入的并发串行化；质控同时越温查询的集合变化分段、相邻同集合合并、门槛过滤、查询窗与装卸时段裁剪（左闭右开）、未闭合区间裁至查询终点、装车前带入的开放区间自装车时刻起算、同刻自有优先、晚到读数后查询反映新结果、空结果与参数 / 未知车次错误；测温值更正的只改温度（时间 / 归属 / 原编号不变）、版本递增与乐观锁、原始记录保留原值另显示有效温度与版本、历次更正可查、自有 / 车载更正后报告 / 时间线 / 责任确认 / 同时越温按有效值重建、车载更正同时影响在车全部货物、同刻自有优先与左闭右开继续适用、交接不可更正、更正与原记录幂等重传 / 异内容冲突 / 版本过期 / 目标缺失拒绝且不落部分结果、更正后历史表态按重建片段判定有效性、车载 / 自有更正并发串行化；装卸前预检的分段分析（货物集合 / 温度上限差异 / 读数覆盖与有效值 / 潜在越温风险与同刻自有取代标记、左闭右开边界）、预检只读不落库、预期车次修订号校验、未知车次 / 货物与非法时段报错、确认携摘要（通过后沿用批量原子校验、重叠整批拒绝）、摘要过期（装卸登记 / 新增读数 / 读数更正 / 挪用到其他批次 / 重复使用均拒绝且不落库）、车次修订号随装卸登记 / 读数写入 / 读数更正单调递增且失败不递增；以及本轮装卸时段更正的只改该条窗口（车次 / 货物归属与稳定身份不变、其它窗口不动）、原窗口与历次更正 append-only 可追溯、车次详情展示当前窗口 / 稳定身份 / 版本、新窗口左闭右开与必须带时区 / 原因为空拒绝、重叠校验排除自身且跨车次 / 同车次重叠整批拒绝（首尾相接允许）、版本乐观锁（过期 `stale_window_version`）、原窗口不存在 / 车次不存在拒绝、同编号同请求幂等 / 异请求冲突、失败不留部分变更且编号可复用、车载读数适用性按当前窗口重算（装车纳入 / 卸货排除）、越温报告 / 时间线 / 责任确认 / 同时越温反映当前窗口、表态历史保留并按重建片段失效、成功推进车次修订号使旧预检摘要过期、装卸时段更正与事件写入并发串行化；以及本轮责任证据封存的封存内容（区间责任片段与来源坐标、当时有效表态与汇总、自有事件原始 / 有效温度与版本、车载读数有效温度 / 版本 / adopted、当前装卸窗口稳定身份 / 当前窗口 / 版本、货物温控、SHA-256 内容摘要与规范化原文一致）、区间不存在 / 开放 / 快照已变拒绝且不留记录、同案件编号同请求在变化 / 重开 / 消失后仍幂等返回原包、异请求 `case_id_conflict` 且原包不变、封存包查询返回原内容与摘要、现况对照四态（unchanged / changed / reopened / disappeared）与证据项（自有事件 / 车载读数 / 装卸窗口）及责任片段的增删变更（测温更正改有效温度与版本、车载读数更正使区间消失、装卸窗口更正改窗口与版本并按当前窗口重算适用性、被同刻自有测温取代读数标记 adopted=false）、晚到记录与更正绝不改写原包、车载 `veh:` 区间封存、封存与事件写入并发串行化。
 
 ## 八、目录结构
 
@@ -776,6 +931,8 @@ DATABASE_URL="sqlite:////tmp/cc.db" \
 │   ├── crud.py            # 自有事件写入事务、幂等、整链校验
 │   ├── correction_crud.py # 测温值更正事务（货物行锁 / 在车货物行锁→车次行锁、版本与幂等）
 │   ├── loading_correction_crud.py # 装卸时段更正事务（货物行锁→车次行锁、窗口版本/重叠排除自身/幂等）
+│   ├── evidence_crud.py   # 责任证据封存事务（货物行锁、快照校验、案件编号幂等/冲突、原包查询与对照）
+│   ├── sealing.py         # 封存证据归集、规范化 JSON / 内容摘要、现况对照（四态与证据项/片段增删变更，纯逻辑）
 │   ├── vehicle_crud.py    # 车次 / 装卸时段 / 车载读数写入事务、装前预检与确认（货物行锁→车次行锁）
 │   ├── stance_crud.py     # 责任表态写入事务（与事件 / 读数共用货物行锁）
 │   ├── timeline.py        # 合并读数时间线（自有事件 + 适用车载读数，同刻自有优先，含更正有效值，按当前窗口判在车）
@@ -783,13 +940,13 @@ DATABASE_URL="sqlite:////tmp/cc.db" \
 │   ├── precheck.py        # 装前预检：在车窗口扫描线分段、上限差异 / 读数覆盖 / 风险分析与摘要指纹（纯函数）
 │   ├── chain.py           # 保管链重建 / 越温责任拆分（纯函数，含 veh: 区间标识）
 │   ├── responsibility.py  # 快照标识、表态有效性、确认汇总（纯逻辑）
-│   ├── models.py          # SQLAlchemy 模型（货物 / 事件 / 车次 / 装卸[当前窗口+稳定身份+版本] / 车载读数 / 表态 / 测温更正 / 装卸更正）
+│   ├── models.py          # SQLAlchemy 模型（货物 / 事件 / 车次 / 装卸[当前窗口+稳定身份+版本] / 车载读数 / 表态 / 测温更正 / 装卸更正 / 责任证据封存）
 │   ├── schemas.py         # Pydantic 请求/响应模型
 │   ├── database.py        # 引擎、Session（含 SQLite 兼容）
 │   └── timeutil.py        # UTC 归一化
 ├── db/init.sql            # PostgreSQL 初始化（枚举、表、约束、索引）
-├── examples/              # curl / Python 调用示例（含车次、车载测温、同时越温查询、测温更正、装前预检确认与装卸时段更正完整链路）
-├── tests/                 # pytest 单元 + API + 责任确认 + 车次车载 + 同时越温 + 测温更正 + 装前预检 + 装卸时段更正 + 并发测试
+├── examples/              # curl / Python 调用示例（含车次、车载测温、同时越温查询、测温更正、装前预检确认、装卸时段更正与责任证据封存完整链路）
+├── tests/                 # pytest 单元 + API + 责任确认 + 车次车载 + 同时越温 + 测温更正 + 装前预检 + 装卸时段更正 + 责任证据封存 + 并发测试
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

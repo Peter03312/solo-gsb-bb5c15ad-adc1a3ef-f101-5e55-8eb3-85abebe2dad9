@@ -839,3 +839,235 @@ class LoadingCorrectionHistory(BaseModel):
     corrections: list[LoadingCorrectionOut] = Field(
         ..., description="历次更正（append-only），按版本升序"
     )
+
+
+# ----------------------------------------------------- 责任证据封存
+
+
+class EvidenceSealCreate(BaseModel):
+    """责任证据封存请求：案件编号 + 货物 + 已闭合区间标识 + 当前快照标识。"""
+
+    case_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="案件编号（客户端指定，封存包主键；同案件编号同请求重试"
+        "返回原包，异请求冲突）",
+    )
+    cargo_id: str = Field(..., min_length=1, max_length=64, description="货物编号")
+    interval_id: str = Field(
+        ..., min_length=1, max_length=68,
+        description="已闭合越温区间的稳定标识：自有开启=测温事件ID；"
+        "车载开启=veh:<读数ID>",
+    )
+    snapshot_id: str = Field(
+        ..., min_length=8, max_length=71,
+        description="封存前查询到的区间当前快照标识；与当前快照不一致"
+        "（快照已变）即拒绝，不留封存记录",
+    )
+
+
+class SealCargo(BaseModel):
+    """封存时的货物温控参数。"""
+
+    cargo_id: str
+    started_at: datetime
+    temp_upper_limit: Decimal
+    initial_holder: str
+
+
+class SealSegment(BaseModel):
+    """封存 / 现况对照中的责任片段（开放区间末段 end 可为 null）。"""
+
+    start: datetime
+    end: datetime | None = None
+    responsible_party: str
+
+
+class SealStance(BaseModel):
+    """封存时一条当时有效的责任方表态（各责任方最新一条有效表态）。"""
+
+    stance_id: str
+    responsible_party: str
+    stance: StanceKind
+    reason: str | None = None
+    created_at: datetime
+    snapshot_id: str | None = Field(
+        ..., description="该表态提交时校验通过的快照标识"
+    )
+    segments: list[SealSegment] = Field(
+        ..., description="该责任方在封存区间内承担的全部片段"
+    )
+
+
+class SealOwnEvent(BaseModel):
+    """封存的一条货物自有事件（测温附当前有效温度与更正版本）。"""
+
+    event_id: str
+    event_type: str
+    occurred_at: datetime
+    temperature: Decimal | None = Field(
+        ..., description="原始测温温度；交接为 null"
+    )
+    effective_temperature: Decimal | None = Field(
+        ..., description="封存时当前有效温度（含更正）；交接为 null"
+    )
+    version: int = Field(..., description="封存时测温更正版本（0=原始值）")
+    giver: str | None = None
+    receiver: str | None = None
+
+
+class SealVehicleReading(BaseModel):
+    """封存的一笔车载读数：当前有效温度、更正版本与封存时是否被采用。"""
+
+    reading_id: str
+    trip_id: str
+    read_at: datetime
+    temperature: Decimal = Field(..., description="原始读数温度")
+    effective_temperature: Decimal = Field(
+        ..., description="封存时当前有效温度（含更正）"
+    )
+    version: int = Field(..., description="封存时更正版本（0=原始值）")
+    adopted: bool = Field(
+        ...,
+        description="封存时该读数是否被本货物采用：同刻有自有测温时为 false"
+        "（原始读数仍随包封存）",
+    )
+
+
+class SealLoadingWindow(BaseModel):
+    """封存的一条当前装卸窗口及窗口版本。"""
+
+    trip_id: str
+    cargo_id: str
+    origin_loaded_at: datetime = Field(
+        ..., description="窗口稳定身份：首次登记装车时刻（更正不改）"
+    )
+    loaded_at: datetime = Field(..., description="封存时当前窗口起点（含）")
+    unloaded_at: datetime = Field(..., description="封存时当前窗口终点（不含）")
+    window_version: int = Field(
+        ..., description="封存时窗口更正版本（0=原始登记）"
+    )
+
+
+class SealInterval(BaseModel):
+    """封存的区间责任片段视图。"""
+
+    interval_id: str
+    start: datetime
+    end: datetime | None
+    is_open: bool = False
+    start_source: str
+    end_source: str | None
+    start_event_id: str | None
+    end_event_id: str | None
+    start_reading_id: str | None
+    end_reading_id: str | None
+    start_trip_id: str | None
+    end_trip_id: str | None
+    snapshot_id: str | None
+    segments: list[SealSegment]
+
+
+class EvidenceSealContent(BaseModel):
+    """封存包内容（此后不可改；查询封存包原样返回）。"""
+
+    case_id: str
+    sealed_at: datetime
+    cargo: SealCargo
+    interval: SealInterval
+    current_valid_stances: list[SealStance] = Field(
+        ..., description="封存时各责任方最新一条有效表态"
+    )
+    summary: str = Field(..., description="封存时的责任确认汇总状态")
+    own_events: list[SealOwnEvent] = Field(
+        ..., description="重建该区间所用的货物自有事件（不晚于区间闭合时刻）"
+    )
+    vehicle_readings: list[SealVehicleReading] = Field(
+        ...,
+        description="重建该区间所用的车载读数（区间内在车适用，含有效温度/"
+        "版本/是否被同刻自有测温取代）",
+    )
+    loading_windows: list[SealLoadingWindow] = Field(
+        ..., description="重建该区间所用的当前装卸窗口及窗口版本"
+    )
+    content_digest: str = Field(
+        ..., description="封存内容摘要：sha256:<hex>（对规范化封存内容取摘要）"
+    )
+
+
+class EvidenceSealOut(BaseModel):
+    """封存回执 / 封存包查询结果。"""
+
+    case_id: str
+    cargo_id: str
+    interval_id: str
+    snapshot_id: str = Field(..., description="封存时绑定的区间当前快照标识")
+    content_digest: str
+    sealed_at: datetime
+    content: EvidenceSealContent = Field(..., description="封存内容原文（不可改）")
+
+
+class EvidenceSealReplay(BaseModel):
+    """同案件编号同请求重传：即使现况已变也返回原封存包。"""
+
+    replayed: bool = True
+    seal: EvidenceSealOut
+    message: str
+
+
+# 现况对照
+
+
+class SealDiffItem(BaseModel):
+    """一个证据项的增 / 删 / 变更。"""
+
+    key: str = Field(
+        ...,
+        description="证据项稳定键：自有事件=event_id；车载读数=reading_id；"
+        "装卸窗口=trip_id|origin_loaded_at",
+    )
+    change: str = Field(..., description="added / removed / changed")
+    fields: list[str] | None = Field(
+        default=None,
+        description="changed 时发生变化的字段名（added/removed 为 null）",
+    )
+    sealed: dict | None = Field(..., description="封存时该项内容；added 时为 null")
+    current: dict | None = Field(..., description="当前该项内容；removed 时为 null")
+
+
+class SealSegmentChange(BaseModel):
+    """一条责任片段的增 / 删 / 变更（以片段起点为稳定键）。"""
+
+    start: datetime
+    change: str = Field(..., description="added / removed / changed")
+    sealed: list | None = Field(..., description="封存片段 [start,end,party]；added 为 null")
+    current: list | None = Field(..., description="当前片段 [start,end,party]；removed 为 null")
+
+
+class SealDiffReport(BaseModel):
+    """封存包 vs 当前现况的对照结果（不改写封存原包）。"""
+
+    case_id: str
+    cargo_id: str
+    interval_id: str
+    status: str = Field(
+        ...,
+        description="unchanged 仍闭合快照相同 / changed 仍闭合快照已变 / "
+        "reopened 区间重开 / disappeared 区间消失",
+    )
+    sealed_snapshot_id: str
+    current_snapshot_id: str | None
+    sealed_at: datetime
+    compared_at: datetime
+    current_interval: SealInterval | None = Field(
+        ...,
+        description="当前区间视图：仍闭合 / 重开时给出（重开 is_open=true、"
+        "end/snapshot 为 null）；区间消失时为 null",
+    )
+    segment_changes: list[SealSegmentChange] = Field(
+        ..., description="责任片段的增 / 删 / 变更（按片段起点排序）"
+    )
+    evidence_changes: dict = Field(
+        ...,
+        description="证据项变更：{own_events, vehicle_readings, loading_windows} "
+        "各为 SealDiffItem 列表（按键排序）",
+    )

@@ -99,6 +99,7 @@ class StanceView:
     reason: str | None
     created_at: datetime
     segments: tuple[SegmentView, ...]   # 该责任方在当前区间内的全部片段
+    snapshot_id: str | None = None      # 表态提交时校验通过的快照标识
 
 
 @dataclass(frozen=True)
@@ -186,6 +187,7 @@ def build_interval_view(
                 reason=s.reason,
                 created_at=s.created_at,
                 segments=_segments_of_party(ex, party),
+                snapshot_id=s.snapshot_id,
             )
         )
 

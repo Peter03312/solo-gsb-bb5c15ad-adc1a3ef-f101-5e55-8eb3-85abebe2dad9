@@ -16,8 +16,10 @@ from app import (
     chain,
     correction_crud,
     crud,
+    evidence_crud,
     loading_correction_crud,
     responsibility,
+    sealing,
     stance_crud,
     timeline,
     vehicle_crud,
@@ -43,6 +45,19 @@ from app.schemas import (
     CorrectionHistoryItem,
     CorrectionOut,
     CorrectionReplay,
+    EvidenceSealContent,
+    EvidenceSealCreate,
+    EvidenceSealOut,
+    EvidenceSealReplay,
+    SealCargo,
+    SealDiffItem,
+    SealDiffReport,
+    SealInterval,
+    SealLoadingWindow,
+    SealOwnEvent,
+    SealSegmentChange,
+    SealStance,
+    SealVehicleReading,
     EventCreate,
     EventOut,
     Excursion,
@@ -181,6 +196,27 @@ async def lifespan(app: FastAPI):
                 "CREATE INDEX IF NOT EXISTS ix_loading_correction_window "
                 "ON loading_correction (trip_id, cargo_id, origin_loaded_at, created_at)"
             )
+            # 4) 责任证据封存表（新表，IF NOT EXISTS 兜底；内容 append-only）
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS evidence_seal (
+                    case_id        VARCHAR(128) PRIMARY KEY,
+                    cargo_id       VARCHAR(64)  NOT NULL
+                                   REFERENCES cargo(cargo_id) ON DELETE RESTRICT,
+                    interval_key   VARCHAR(68)  NOT NULL,
+                    snapshot_id    VARCHAR(71)  NOT NULL,
+                    request_hash   VARCHAR(71)  NOT NULL,
+                    content        TEXT         NOT NULL,
+                    content_digest VARCHAR(71)  NOT NULL,
+                    sealed_at      TIMESTAMPTZ  NOT NULL,
+                    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now()
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_evidence_seal_cargo_interval "
+                "ON evidence_seal (cargo_id, interval_key)"
+            )
     yield
 
 
@@ -197,8 +233,14 @@ app = FastAPI(
         "装卸时段录错后可凭原车次/货物/首次登记装车时刻、期望版本、修正后的"
         "带时区时刻与原因更正单条装卸窗口（只改该条窗口，append-only 可追溯，"
         "车载适用性/越温/责任/质控按当前窗口重建，成功推进车次修订号）。"
+        "调查人员可对已闭合越温区间封存责任证据（凭案件编号、货物编号、区间"
+        "标识与当前快照标识）：在一致视图上保存区间责任片段、当时有效表态与"
+        "重建所用自有事件、车载读数有效温度/版本、当前装卸窗口及版本，生成"
+        "内容摘要，封存后不可改；区间消失/重开/快照已变拒绝且不留记录，"
+        "同案件编号同请求重试即使现况已变仍返回原包，并支持封存包查询与"
+        "现况对照（证据项/责任片段增删变更，晚到记录与更正不改写原包）。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -1443,6 +1485,126 @@ def list_loading_corrections(
         version=version,
         corrections=corrections,
     )
+
+
+# ---------------------------------------------------------------- 责任证据封存
+
+
+def _seal_content_for_response(content: dict, content_digest: str) -> dict:
+    """封存内容（规范化 JSON 形态：片段为三元组、无摘要字段）-> 响应模型形态。"""
+    def seg_obj(triple):
+        return {
+            "start": triple[0],
+            "end": triple[1],
+            "responsible_party": triple[2],
+        }
+
+    body = dict(content)
+    interval = dict(body["interval"])
+    interval["segments"] = [seg_obj(t) for t in interval["segments"]]
+    body["interval"] = interval
+    body["current_valid_stances"] = [
+        dict(s, segments=[seg_obj(t) for t in s["segments"]])
+        for s in body["current_valid_stances"]
+    ]
+    body["content_digest"] = content_digest
+    return body
+
+
+def _seal_out(row, content: dict) -> EvidenceSealOut:
+    return EvidenceSealOut(
+        case_id=row.case_id,
+        cargo_id=row.cargo_id,
+        interval_id=row.interval_key,
+        snapshot_id=row.snapshot_id,
+        content_digest=row.content_digest,
+        sealed_at=ensure_utc(row.sealed_at),
+        content=EvidenceSealContent.model_validate(
+            _seal_content_for_response(content, row.content_digest)
+        ),
+    )
+
+
+@app.post(
+    "/evidence-seals",
+    response_model=EvidenceSealOut,
+    status_code=201,
+    tags=["责任证据封存"],
+    responses={
+        200: {
+            "model": EvidenceSealReplay,
+            "description": "同案件编号同请求重传：即使现况已变也返回原封存包",
+        },
+        404: {"description": "货物 / 已闭合区间不存在"},
+        409: {"description": "快照已变 / 案件编号异请求冲突"},
+        422: {"description": "区间仍开放"},
+    },
+)
+def create_evidence_seal(payload: EvidenceSealCreate, db: Session = Depends(get_db)):
+    """封存一个已闭合越温区间的责任证据。
+
+    调查人员凭**案件编号**、货物编号、已闭合区间稳定标识与其**当前快照
+    标识**封存。封存于持货物行锁的单事务内、在一致的已提交视图上保存：
+    区间责任片段、当时各责任方有效表态，以及重建该区间所用的自有事件、
+    车载读数（当前有效温度与版本、是否被自有测温取代）、当前装卸窗口及
+    版本，并生成内容摘要（``content_digest``）。封存内容此后不可改。
+
+    * 区间消失 / 重开（``404`` / ``422``）或快照已变（``409 stale_snapshot``）
+      一律拒绝，事务回滚、不留封存记录；
+    * 同案件编号 + 同请求（货物 / 区间 / 快照一致）重试：**即使现况已变**
+      也返回原封存包（``200 replayed=true``）；
+    * 同案件编号 + 异请求 → ``409 case_id_conflict``。
+    """
+    result = evidence_crud.create_seal(db, payload)
+    body = _seal_out(result.row, result.content)
+    if result.replayed:
+        return JSONResponse(
+            status_code=200,
+            content=EvidenceSealReplay(
+                seal=body,
+                message="相同请求的责任证据封存包已存在，重传返回原包"
+                "（幂等；即使区间此后已消失 / 重开 / 快照变化，原包不变）",
+            ).model_dump(mode="json"),
+        )
+    return body
+
+
+@app.get(
+    "/evidence-seals/{case_id}",
+    response_model=EvidenceSealOut,
+    tags=["责任证据封存"],
+    responses={404: {"description": "封存包不存在"}},
+)
+def get_evidence_seal(case_id: str, db: Session = Depends(get_db)) -> EvidenceSealOut:
+    """按案件编号查询封存包：返回原封存内容与内容摘要（此后不可改）。"""
+    result = evidence_crud.get_seal(db, case_id)
+    return _seal_out(result.row, result.content)
+
+
+@app.get(
+    "/evidence-seals/{case_id}/diff",
+    response_model=SealDiffReport,
+    tags=["责任证据封存"],
+    responses={404: {"description": "封存包不存在"}},
+)
+def diff_evidence_seal(case_id: str, db: Session = Depends(get_db)) -> SealDiffReport:
+    """封存包对照当前现况：列出证据项与责任片段的增 / 删 / 变更。
+
+    状态 ``status``：``unchanged``（区间仍闭合且快照相同）/ ``changed``
+    （仍闭合但边界或责任片段已变）/ ``reopened``（区间重开，明确状态）/
+    ``disappeared``（区间消失，明确状态）。晚到记录与测温 / 装卸更正只
+    反映在本对照结果中，**绝不改写封存原包**；对照为只读操作。
+    """
+    report = evidence_crud.build_seal_diff(db, case_id)
+    # current_interval.segments 为规范化三元组，转成响应对象
+    if report.get("current_interval") is not None:
+        ci = dict(report["current_interval"])
+        ci["segments"] = [
+            {"start": t[0], "end": t[1], "responsible_party": t[2]}
+            for t in ci["segments"]
+        ]
+        report["current_interval"] = ci
+    return SealDiffReport.model_validate(report)
 
 
 @app.get("/health", tags=["运维"])

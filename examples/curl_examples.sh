@@ -606,3 +606,142 @@ curl -sS -X POST "$BASE/trips/$LTRIP/loading-corrections" \
     \"new_loaded_at\": \"2026-09-30T17:00:00+08:00\",
     \"new_unloaded_at\": \"2026-09-30T17:00:00+08:00\", \"reason\": \"非法时段\"
   }"; echo
+
+echo
+echo "================ 本轮新增：责任证据封存 ================"
+# 独立演示货物：车载读数开启 / 闭合越温区间，跨一笔交接拆分责任
+SC="COLD-SEAL-1"; ST="TRUCK-SEAL-1"; CASEID="CASE-2026-0001"
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$SC\",
+  \"started_at\": \"2026-10-01T08:00:00+08:00\",
+  \"temp_upper_limit\": \"4.0\",
+  \"initial_holder\": \"北京冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips" -H 'Content-Type: application/json' -d "{
+  \"trip_id\": \"$ST\", \"vehicle_no\": \"京B-证001\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips/$ST/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{\"cargo_id\": \"$SC\",
+    \"loaded_at\": \"2026-10-01T08:30:00+08:00\",
+    \"unloaded_at\": \"2026-10-01T18:00:00+08:00\"}]
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-seal-1\", \"trip_id\": \"$ST\",
+  \"read_at\": \"2026-10-01T09:00:00+08:00\", \"temperature\": \"7.0\"
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-seal-2\", \"trip_id\": \"$ST\",
+  \"read_at\": \"2026-10-01T15:00:00+08:00\", \"temperature\": \"2.0\"
+}" >/dev/null
+
+read -r SEAL_IID SEAL_SNAP < <(python3 - "$BASE" "$SC" <<'PY'
+import json, sys, urllib.request
+base, cargo = sys.argv[1], sys.argv[2]
+with urllib.request.urlopen(f"{base}/cargo/{cargo}/responsibilities") as r:
+    iv = json.load(r)["intervals"][0]
+print(iv["interval_id"], iv["snapshot_id"])
+PY
+)
+echo "封存目标：货物=$SC 区间=$SEAL_IID（车载开启） 快照=$SEAL_SNAP"
+
+echo "56) 封存责任证据：案件编号 + 货物 + 已闭合区间标识 + 当前快照标识"
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"$CASEID\",
+  \"cargo_id\": \"$SC\",
+  \"interval_id\": \"$SEAL_IID\",
+  \"snapshot_id\": \"$SEAL_SNAP\"
+}" | python3 -m json.tool
+
+echo "57) 同案件编号同请求重传 -> 200 replayed，返回原封存包"
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"$CASEID\", \"cargo_id\": \"$SC\",
+  \"interval_id\": \"$SEAL_IID\", \"snapshot_id\": \"$SEAL_SNAP\"
+}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    replayed =", d.get("replayed"), "digest =", d["content_digest"][:24], "...")'
+
+echo "58) 查询封存包：原内容与内容摘要（封存后不可改）"
+curl -sS "$BASE/evidence-seals/$CASEID" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("    case =", d["case_id"], "digest =", d["content_digest"][:24], "...")
+print("    责任片段 =", [(s["start"][11:16], s["end"][11:16], s["responsible_party"]) for s in d["content"]["interval"]["segments"]])
+print("    车载读数 =", [(r["reading_id"], r["temperature"], r["effective_temperature"], "v"+str(r["version"]), "适用" if r["applicable"] else "不适用", "采用" if r["adopted"] else "取代") for r in d["content"]["vehicle_readings"]])
+print("    装卸窗口 =", [(w["trip_id"], "v"+str(w["window_version"])) for w in d["content"]["loading_windows"]])
+print("    车次修订号 =", {t["trip_id"]: t["revision"] for t in d["content"]["trips"]})'
+
+echo "59) 对照现况（此刻无变化）：interval_status=sealed，matches_current=true"
+curl -sS "$BASE/evidence-seals/$CASEID/comparison" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("    interval_status =", d["interval_status"], "matches_current =", d["matches_current"])'
+
+echo "60) 后续晚到：新增一笔区间内车载读数（10:00，8℃，仍超限，不改变区间边界）"
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-seal-late\", \"trip_id\": \"$ST\",
+  \"read_at\": \"2026-10-01T10:00:00+08:00\", \"temperature\": \"8.0\"
+}" >/dev/null
+curl -sS "$BASE/evidence-seals/$CASEID/comparison" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("    interval_status =", d["interval_status"], "snapshot_changed =", d["snapshot_changed"])
+print("    新增读数 =", [r["reading_id"] for r in d["evidence"]["vehicle_readings"]["added"]])
+print("    车次修订号变更 =", [(c["key"]["trip_id"], c["fields"]["revision"]) for c in d["evidence"]["trips"]["changed"]])'
+
+echo "61) 晚到交接（11:00 北京冷库 -> 上海冷库，区间内，链合法）：责任片段变化、快照变化"
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"ev-seal-h1\", \"cargo_id\": \"$SC\",
+  \"occurred_at\": \"2026-10-01T11:00:00+08:00\",
+  \"giver\": \"北京冷库\", \"receiver\": \"上海冷库\"
+}" >/dev/null
+read -r NEW_SNAP < <(python3 - "$BASE" "$SC" <<'PY'
+import json, sys, urllib.request
+base, cargo = sys.argv[1], sys.argv[2]
+with urllib.request.urlopen(f"{base}/cargo/{cargo}/responsibilities") as r:
+    print(json.load(r)["intervals"][0]["snapshot_id"])
+PY
+)
+echo "    新快照=$NEW_SNAP（不同于封存快照）"
+curl -sS "$BASE/evidence-seals/$CASEID/comparison" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("    snapshot_changed =", d["snapshot_changed"], "matches_current =", d["matches_current"])
+print("    片段新增 =", [(s["start"][11:16], s["responsible_party"]) for s in d["segments"]["added"]])
+print("    片段变更 =", [(c["key"]["start"][11:16], c["key"]["responsible_party"], c["before"]["end"][11:16], "->", c["after"]["end"][11:16]) for c in d["segments"]["changed"]])'
+
+echo "62) 以旧快照用新案件封存 -> 409 stale_snapshot（快照已变，拒绝且不留记录）"
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"CASE-STALE\", \"cargo_id\": \"$SC\",
+  \"interval_id\": \"$SEAL_IID\", \"snapshot_id\": \"$SEAL_SNAP\"
+}" | python3 -c 'import json,sys; print("   ", json.load(sys.stdin)["error"]["code"])'
+
+echo "63) 后续更正：闭合读数 vr-seal-2 2 -> 9℃（仍超限）-> 区间重新开放"
+curl -sS -X POST "$BASE/corrections" -H 'Content-Type: application/json' -d "{
+  \"correction_id\": \"corr-seal-demo\",
+  \"target_type\": \"vehicle_reading\",
+  \"target_id\": \"vr-seal-2\",
+  \"expected_version\": 0,
+  \"new_temperature\": \"9.0\"
+}" >/dev/null
+curl -sS "$BASE/evidence-seals/$CASEID/comparison" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("    interval_status =", d["interval_status"], "current_snapshot_id =", d["current_snapshot_id"])
+print("    删除片段责任方 =", [s["responsible_party"] for s in d["segments"]["removed"]])
+ch = [c for c in d["evidence"]["vehicle_readings"]["changed"] if c["key"]["reading_id"]=="vr-seal-2"][0]
+print("    vr-seal-2 有效温度 before/after =", ch["fields"]["effective_temperature"], "版本 =", ch["fields"]["version"])'
+
+echo "64) 区间重开后重新封存被拒（422 interval_open，不留记录）；同案件同请求仍返回原包（200）"
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"CASE-NEW-OPEN\", \"cargo_id\": \"$SC\",
+  \"interval_id\": \"$SEAL_IID\", \"snapshot_id\": \"$NEW_SNAP\"
+}" | python3 -c 'import json,sys; print("   ", json.load(sys.stdin)["error"]["code"])'
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"$CASEID\", \"cargo_id\": \"$SC\",
+  \"interval_id\": \"$SEAL_IID\", \"snapshot_id\": \"$SEAL_SNAP\"
+}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    replayed =", d.get("replayed"), "原包片段数 =", len(d["content"]["interval"]["segments"]), "原读数版本 =", [r["version"] for r in d["content"]["vehicle_readings"]])'
+
+echo "65) 同案件编号异请求 -> 409 seal_case_conflict（原包不变）"
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"$CASEID\", \"cargo_id\": \"$SC\",
+  \"interval_id\": \"$SEAL_IID\",
+  \"snapshot_id\": \"sha256:0000000000000000000000000000000000000000000000000000000000000000\"
+}" | python3 -c 'import json,sys; print("   ", json.load(sys.stdin)["error"]["code"])'

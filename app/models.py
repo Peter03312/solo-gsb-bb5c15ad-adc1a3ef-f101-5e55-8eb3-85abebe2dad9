@@ -467,3 +467,44 @@ class LoadingCorrection(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class EvidenceSeal(Base):
+    """责任证据封存包（只追加、不可变）。
+
+    调查人员凭**案件编号** ``case_id``、货物编号、已闭合越温区间的稳定标识
+    与封存时的**当前快照标识**封存证据。封存行在一致的已提交视图
+    （PostgreSQL 下 REPEATABLE READ + 货物行锁）中写入，保存：
+
+    * 区间责任片段与当时各责任方的**有效表态**；
+    * 重建该区间所用的货物自有事件（原始 / 有效温度与更正版本）；
+    * 相关车次车载读数（原始 / 有效温度 / 版本，及其对该货物的适用 / 采用标记）；
+    * 当前装卸窗口（含稳定身份与窗口版本）、车次（含修订号）与货物基线信息。
+
+    ``payload`` 为上述内容的**规范化 JSON**（单行、键排序、UTC 时间、千分位
+    温度字符串），``content_digest`` 为其 SHA-256（``sha256:`` 前缀），即内容
+    摘要；封存后该行永不更新（无任何改写路径）。区间消失 / 重开 / 快照已变
+    时封存被拒绝且不留任何记录。同案件编号同请求（货物 + 区间 + 快照相同）
+    重传即使现况已变也返回原包；同案件编号异请求冲突。
+    """
+
+    __tablename__ = "evidence_seal"
+    __table_args__ = (
+        Index("ix_evidence_seal_cargo_interval", "cargo_id", "interval_id"),
+    )
+
+    case_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    cargo_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("cargo.cargo_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    interval_id: Mapped[str] = mapped_column(String(68), nullable=False)
+    snapshot_id: Mapped[str] = mapped_column(String(71), nullable=False)
+    content_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    payload: Mapped[str] = mapped_column(String, nullable=False)
+    sealed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )

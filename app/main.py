@@ -18,6 +18,8 @@ from app import (
     crud,
     loading_correction_crud,
     responsibility,
+    seal_crud,
+    sealing,
     stance_crud,
     timeline,
     vehicle_crud,
@@ -66,6 +68,11 @@ from app.schemas import (
     ResponsibilityInterval,
     ResponsibilityReport,
     ResponsibilitySegment,
+    SealComparison,
+    SealCreate,
+    SealEnvelope,
+    SealPackageContent,
+    SealReplay,
     StanceCreate,
     StanceHistory,
     StanceHistoryItem,
@@ -181,6 +188,25 @@ async def lifespan(app: FastAPI):
                 "CREATE INDEX IF NOT EXISTS ix_loading_correction_window "
                 "ON loading_correction (trip_id, cargo_id, origin_loaded_at, created_at)"
             )
+            # 4) 责任证据封存表（新表，IF NOT EXISTS 兜底；只追加，无升级改写）
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS evidence_seal (
+                    case_id        VARCHAR(64)   PRIMARY KEY,
+                    cargo_id       VARCHAR(64)   NOT NULL
+                                     REFERENCES cargo(cargo_id) ON DELETE RESTRICT,
+                    interval_id    VARCHAR(68)   NOT NULL,
+                    snapshot_id    VARCHAR(71)   NOT NULL,
+                    content_digest VARCHAR(71)   NOT NULL,
+                    payload        TEXT          NOT NULL,
+                    sealed_at      TIMESTAMPTZ   NOT NULL DEFAULT now()
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_evidence_seal_cargo_interval "
+                "ON evidence_seal (cargo_id, interval_id)"
+            )
     yield
 
 
@@ -197,8 +223,12 @@ app = FastAPI(
         "装卸时段录错后可凭原车次/货物/首次登记装车时刻、期望版本、修正后的"
         "带时区时刻与原因更正单条装卸窗口（只改该条窗口，append-only 可追溯，"
         "车载适用性/越温/责任/质控按当前窗口重建，成功推进车次修订号）。"
+        "调查人员可凭案件编号、货物、已闭合区间标识及其当前快照标识封存责任"
+        "证据（区间责任片段、当时有效表态与重建证据 + SHA-256 内容摘要，"
+        "封存后不可改）；区间消失 / 重开 / 快照已变拒绝且不留记录，同案件"
+        "同请求重传返回原包，并支持只读对照现况的增删与变更。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -1443,6 +1473,105 @@ def list_loading_corrections(
         version=version,
         corrections=corrections,
     )
+
+
+# ---------------------------------------------------------------- 责任证据封存
+
+
+def _seal_envelope(result) -> SealEnvelope:
+    """封存结果 -> 响应信封（内容为封存行中的原 JSON，不含任何后续改写）。"""
+    seal, payload = result.seal, result.payload
+    sealed_at = ensure_utc(seal.sealed_at)
+    return SealEnvelope(
+        case_id=seal.case_id,
+        cargo_id=seal.cargo_id,
+        interval_id=seal.interval_id,
+        snapshot_id=seal.snapshot_id,
+        content_digest=seal.content_digest,
+        sealed_at=sealed_at,
+        content=SealPackageContent.model_validate(payload),
+    )
+
+
+@app.post(
+    "/evidence-seals",
+    response_model=SealEnvelope,
+    status_code=201,
+    tags=["责任证据封存"],
+    responses={
+        200: {
+            "model": SealReplay,
+            "description": "同案件编号同请求重传：返回原封存包（即使现况已变）",
+        },
+        404: {"description": "货物 / 已闭合区间不存在"},
+        409: {"description": "快照已变化 / 同案件编号异请求冲突"},
+        422: {"description": "区间已重新开放"},
+    },
+)
+def create_evidence_seal(payload: SealCreate, db: Session = Depends(get_db)):
+    """封存责任证据。
+
+    调查人员凭**案件编号**、货物编号、**已闭合越温区间标识**及其**当前快照
+    标识**封存。封存于一致的已提交视图（REPEATABLE READ + 货物行锁）中固化：
+    区间责任片段、当时各责任方有效表态、重建该区间所用的货物自有事件（原始 /
+    有效温度与版本）、相关车次车载读数（原始 / 有效温度 / 版本与适用、采用
+    标记）、当前装卸窗口（含稳定身份与窗口版本）及车次快照（含修订号），并对
+    规范化内容生成 SHA-256 **内容摘要**；封存内容此后不可改。
+
+    区间消失 → ``404 interval_not_found``、区间重开 → ``422 interval_open``、
+    快照已变 → ``409 stale_snapshot``，一律拒绝且不留记录。同案件编号同请求
+    重传即使现况已变仍返回原包（``200 replayed``）；同案件编号异请求
+    ``409 seal_case_conflict``。
+    """
+    result = seal_crud.seal_evidence(db, payload)
+    envelope = _seal_envelope(result)
+    if result.replayed:
+        return JSONResponse(
+            status_code=200,
+            content=SealReplay(
+                **envelope.model_dump(mode="json"),
+                message=(
+                    "该案件编号的封存包已存在且请求相同，返回原封存包（幂等；"
+                    "即使区间此后消失 / 重开 / 快照变化，原包内容也不变）"
+                ),
+            ).model_dump(mode="json"),
+        )
+    return envelope
+
+
+@app.get(
+    "/evidence-seals/{case_id}",
+    response_model=SealEnvelope,
+    tags=["责任证据封存"],
+    responses={404: {"description": "封存包不存在"}},
+)
+def get_evidence_seal(case_id: str, db: Session = Depends(get_db)) -> SealEnvelope:
+    """查询封存包：返回**原内容与内容摘要**（晚到记录 / 更正永不改写原包）。"""
+    return _seal_envelope(seal_crud.get_seal(db, case_id))
+
+
+@app.get(
+    "/evidence-seals/{case_id}/comparison",
+    response_model=SealComparison,
+    tags=["责任证据封存"],
+    responses={404: {"description": "封存包不存在"}},
+)
+def compare_evidence_seal(
+    case_id: str, db: Session = Depends(get_db)
+) -> SealComparison:
+    """对照封存包与**当前现况**（只读，不改写原包）。
+
+    返回区间当前状态（``sealed`` 仍存在且已闭合 / ``disappeared`` 已消失 /
+    ``reopened`` 已重开）、封存与当前快照标识、责任片段的增删 / 变更，以及
+    各证据集（自有事件、车载读数、装卸窗口、车次、有效表态）的增删与字段级
+    变更（before=封存值，after=当前值）。封存后晚到的记录与更正只在此处呈现，
+    不改变原封存包；无任何差异时 ``matches_current=true``。
+    """
+    result = seal_crud.get_seal(db, case_id)
+    current = seal_crud.get_current_view(db, result.seal)
+    comparison = sealing.compare_sealed(result.payload, current)
+    comparison["case_id"] = case_id
+    return SealComparison.model_validate(comparison)
 
 
 @app.get("/health", tags=["运维"])

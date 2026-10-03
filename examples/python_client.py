@@ -635,6 +635,66 @@ def main() -> None:
                  "new_loaded_at": "2026-09-30T17:00:00+08:00",
                  "new_unloaded_at": "2026-09-30T17:00:00+08:00"}))
 
+        # ------------------------------------------------ 责任证据封存
+        seal_cargo = "COLD-SEAL-PY"
+        seal_trip = "TRUCK-SEAL-PY"
+        case_id = "CASE-PY-0001"
+        show("创建封存演示货物",
+             api.post("/cargo", json={
+                 "cargo_id": seal_cargo,
+                 "started_at": "2026-10-01T08:00:00+08:00",
+                 "temp_upper_limit": "4.0",
+                 "initial_holder": "北京冷库"}))
+        api.post("/trips", json={"trip_id": seal_trip, "vehicle_no": "京B-证Py"})
+        api.post(f"/trips/{seal_trip}/manifest", json={"items": [{
+            "cargo_id": seal_cargo,
+            "loaded_at": "2026-10-01T08:30:00+08:00",
+            "unloaded_at": "2026-10-01T18:00:00+08:00"}]})
+        api.post("/vehicle-readings", json={
+            "reading_id": "py-vr-seal-1", "trip_id": seal_trip,
+            "read_at": "2026-10-01T09:00:00+08:00", "temperature": "7.0"})
+        api.post("/vehicle-readings", json={
+            "reading_id": "py-vr-seal-2", "trip_id": seal_trip,
+            "read_at": "2026-10-01T15:00:00+08:00", "temperature": "2.0"})
+
+        interval = api.get(
+            f"/cargo/{seal_cargo}/responsibilities").json()["intervals"][0]
+        iid, snap = interval["interval_id"], interval["snapshot_id"]
+        print("待封存区间：", iid, "快照：", snap[:24], "...")
+
+        seal_body = {"case_id": case_id, "cargo_id": seal_cargo,
+                     "interval_id": iid, "snapshot_id": snap}
+        show("封存责任证据（201，返回原内容 + SHA-256 内容摘要）",
+             api.post("/evidence-seals", json=seal_body))
+        show("同案件同请求重传（200 replayed，即使现况已变也返回原包）",
+             api.post("/evidence-seals", json=seal_body))
+        show("查询封存包（原内容与摘要）",
+             api.get(f"/evidence-seals/{case_id}"))
+        show("对照现况（无变化：matches_current=true）",
+             api.get(f"/evidence-seals/{case_id}/comparison"))
+
+        # 后续：闭合读数更正为仍超限 -> 区间重开；对照明确状态且不改原包
+        show("闭合读数更正为 9℃（区间将重开）",
+             api.post("/corrections", json={
+                 "correction_id": "py-corr-seal",
+                 "target_type": "vehicle_reading",
+                 "target_id": "py-vr-seal-2",
+                 "expected_version": 0,
+                 "new_temperature": "9.0"}))
+        show("对照现况（interval_status=reopened，片段列为删除）",
+             api.get(f"/evidence-seals/{case_id}/comparison"))
+        show("重开后重新封存（422 interval_open，不留记录）",
+             api.post("/evidence-seals",
+                      json={**seal_body, "case_id": "CASE-PY-OPEN"}))
+        show("同案件同请求仍返回原包（200 replayed）",
+             api.post("/evidence-seals", json=seal_body))
+        show("同案件异请求（409 seal_case_conflict）",
+             api.post("/evidence-seals",
+                      json={**seal_body, "snapshot_id":
+                            "sha256:" + "0" * 64}))
+        show("未知封存包查询（404 seal_not_found）",
+             api.get("/evidence-seals/NOPE"))
+
 
 if __name__ == "__main__":
     main()
